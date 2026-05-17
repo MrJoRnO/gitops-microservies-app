@@ -1,0 +1,123 @@
+name: "CD — Build, Scan & GitOps Update"
+
+# Runs only when code lands on a deployable branch.
+# dev   → dev cluster   (staging namespace)
+# staging → staging cluster (staging namespace)
+# main  → production cluster (production namespace)
+
+on:
+  push:
+    branches: [dev, staging, main]
+    paths-ignore:
+      - "README.md"
+      - ".gitignore"
+      - "tests/**"
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REPOSITORY: platform/saas-api-gateway
+  CONFIG_REPO: gitops-microservies-config
+
+jobs:
+  build-scan-deploy:
+    name: "Build → Scan → Push → GitOps"
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write   # required for OIDC auth to AWS
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── AWS Auth (OIDC — no static keys) ───────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: "true"
+
+      # ── Image metadata ──────────────────────────────────────────────────────
+      - name: Compute image tag and environment mapping
+        id: meta
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          SHORT_SHA="${GITHUB_SHA::8}"
+          REGISTRY="${{ steps.ecr-login.outputs.registry }}"
+          IMAGE_URI="$REGISTRY/${{ env.ECR_REPOSITORY }}:$BRANCH-$SHORT_SHA"
+
+          # Map app-repo branch → config-repo branch + kustomize overlay
+          case "$BRANCH" in
+            main)    CONFIG_BRANCH="main";    OVERLAY="production" ;;
+            staging) CONFIG_BRANCH="staging"; OVERLAY="staging"    ;;
+            dev)     CONFIG_BRANCH="dev";     OVERLAY="staging"    ;;
+          esac
+
+          echo "image_uri=$IMAGE_URI"           >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA"           >> $GITHUB_OUTPUT
+          echo "config_branch=$CONFIG_BRANCH"   >> $GITHUB_OUTPUT
+          echo "overlay=$OVERLAY"               >> $GITHUB_OUTPUT
+
+      # ── Build ───────────────────────────────────────────────────────────────
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg BUILD_DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --build-arg GIT_SHA="${GITHUB_SHA}" \
+            -t "${{ steps.meta.outputs.image_uri }}" .
+
+      # ── Security scan ───────────────────────────────────────────────────────
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.image_uri }}
+          format: table
+          exit-code: "1"          # fail the pipeline on CRITICAL findings
+          ignore-unfixed: true
+          severity: CRITICAL
+
+      # ── Push ────────────────────────────────────────────────────────────────
+      - name: Push image to ECR
+        run: docker push "${{ steps.meta.outputs.image_uri }}"
+
+      # ── GitOps update ───────────────────────────────────────────────────────
+      - name: Update config-repo image tag (kustomize)
+        env:
+          GH_TOKEN: ${{ secrets.GHA_PAT }}
+          IMAGE_URI: ${{ steps.meta.outputs.image_uri }}
+          CONFIG_BRANCH: ${{ steps.meta.outputs.config_branch }}
+          OVERLAY: ${{ steps.meta.outputs.overlay }}
+        run: |
+          # Install kustomize
+          curl -sL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" \
+            | bash -s -- /usr/local/bin
+
+          git config --global user.email "ci-bot@platform.internal"
+          git config --global user.name  "Platform CI Bot"
+
+          # Clone the correct branch of the config-repo
+          git clone --depth 1 --branch "$CONFIG_BRANCH" \
+            "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository_owner }}/${{ env.CONFIG_REPO }}.git" \
+            config-repo
+
+          cd config-repo/apps/overlays/$OVERLAY
+
+          # Precise image update — no sed, no regex accidents
+          kustomize edit set image "platform/saas-api-gateway=$IMAGE_URI"
+
+          cd ../../../..
+
+          git -C config-repo add apps/overlays/$OVERLAY/kustomization.yaml
+          git -C config-repo diff --staged --quiet \
+            && echo "Image tag unchanged — skipping commit" && exit 0
+
+          git -C config-repo commit \
+            -m "chore(release): saas-api-gateway → ${{ steps.meta.outputs.short_sha }} [$CONFIG_BRANCH] [skip ci]"
+          git -C config-repo push origin "$CONFIG_BRANCH"
