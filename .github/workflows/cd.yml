@@ -91,6 +91,9 @@ jobs:
         run: docker push "${{ steps.meta.outputs.image_uri }}"
 
       # ── GitOps update ───────────────────────────────────────────────────────
+      - name: Setup kustomize
+        uses: imranismail/setup-kustomize@v2
+
       - name: Update config-repo image tag (kustomize)
         env:
           GH_TOKEN: ${{ secrets.GHA_PAT }}
@@ -98,10 +101,6 @@ jobs:
           CONFIG_BRANCH: ${{ steps.meta.outputs.config_branch }}
           OVERLAY: ${{ steps.meta.outputs.overlay }}
         run: |
-          # Install kustomize
-          curl -sL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" \
-            | bash -s -- /usr/local/bin
-
           git config --global user.email "ci-bot@platform.internal"
           git config --global user.name  "Platform CI Bot"
 
