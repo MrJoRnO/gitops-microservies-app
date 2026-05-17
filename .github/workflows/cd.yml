@@ -1,17 +1,13 @@
 name: "CD — Build, Scan & GitOps Update"
 
-# Runs only when code lands on a deployable branch.
-# dev   → dev cluster   (staging namespace)
-# staging → staging cluster (staging namespace)
-# main  → production cluster (production namespace)
+# Triggered only after CI passes — never runs in parallel with CI.
+# workflow_run fires when "CI — Lint & Test" completes on a deployable branch.
 
 on:
-  push:
+  workflow_run:
+    workflows: ["CI — Lint & Test"]
     branches: [dev, staging, main]
-    paths-ignore:
-      - "README.md"
-      - ".gitignore"
-      - "tests/**"
+    types: [completed]
 
 env:
   AWS_REGION: eu-central-1
@@ -23,13 +19,19 @@ jobs:
     name: "Build → Scan → Push → GitOps"
     runs-on: ubuntu-latest
 
+    # Only proceed if CI actually passed — skip if CI failed or was cancelled
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
     permissions:
       contents: read
       id-token: write   # required for OIDC auth to AWS
 
     steps:
+      # Checkout the exact commit that triggered CI (not the default branch HEAD)
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       # ── AWS Auth (OIDC — no static keys) ───────────────────────────────────
       - name: Configure AWS credentials
@@ -48,8 +50,9 @@ jobs:
       - name: Compute image tag and environment mapping
         id: meta
         run: |
-          BRANCH="${GITHUB_REF_NAME}"
-          SHORT_SHA="${GITHUB_SHA::8}"
+          BRANCH="${{ github.event.workflow_run.head_branch }}"
+          SHORT_SHA="${{ github.event.workflow_run.head_sha }}"
+          SHORT_SHA="${SHORT_SHA::8}"
           REGISTRY="${{ steps.ecr-login.outputs.registry }}"
           IMAGE_URI="$REGISTRY/${{ env.ECR_REPOSITORY }}:$BRANCH-$SHORT_SHA"
 
@@ -70,7 +73,7 @@ jobs:
         run: |
           docker build \
             --build-arg BUILD_DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
-            --build-arg GIT_SHA="${GITHUB_SHA}" \
+            --build-arg GIT_SHA="${{ github.event.workflow_run.head_sha }}" \
             -t "${{ steps.meta.outputs.image_uri }}" .
 
       # ── Security scan ───────────────────────────────────────────────────────
